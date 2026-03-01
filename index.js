@@ -12,25 +12,24 @@ const path = require("path");
 // Env
 // =====================
 const PORT = process.env.PORT || 10000;
+
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-// 掃描頻率（毫秒）
-// 5分鐘 = 300000；你要更快例如2分鐘 = 120000
+// 掃描頻率（毫秒）預設 5 分鐘
 const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 300000);
 
-// 同一股票同一種提醒冷卻（避免洗版）
+// 同一股票同一提醒的冷卻時間（避免洗版）預設 30 分鐘
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 30 * 60 * 1000);
 
-// 技術判斷預設
-const DEFAULT_PREFS = {
-  volumeBoost: 1.5, // 成交量 > 近20日均量 * 1.5
-  lookback: 30,     // 支撐壓力回看天數
-  breakoutPct: 0.0  // 突破壓力要加多少%(0=只要突破就算)
-};
+// 追蹤提醒條件：量放大倍數（預設 1.5 倍）
+const DEFAULT_VOLUME_BOOST = Number(process.env.DEFAULT_VOLUME_BOOST || 1.5);
+
+// 追蹤提醒條件：看近幾日（預設 20 日）
+const DEFAULT_LOOKBACK = Number(process.env.DEFAULT_LOOKBACK || 20);
 
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.error("Missing LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
@@ -71,7 +70,7 @@ app.listen(PORT, () => {
 // =====================
 // Storage (Watchlist)
 // =====================
-// 建議 Render 掛 Disk 到 /data（最穩）
+// Render 建議掛 Disk 到 /data（最穩）
 // 沒掛 disk 也能跑，只是重啟可能會清空
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const FALLBACK_DIR = path.join(__dirname, "data");
@@ -93,13 +92,12 @@ if (!ensureDir(STORE_DIR)) {
 
 const STORE_FILE = path.join(STORE_DIR, "watchlist.json");
 
-// 結構：
+// store 結構：
 // {
 //   users: {
-//     "<id>": {
+//     "<userId>": {
 //        tickers: ["2330.TW", "AAPL"],
-//        prefs: { volumeBoost: 1.5, lookback: 30, breakoutPct: 0 },
-//        scanEnabled: true
+//        prefs: { volumeBoost: 1.5, lookback: 20 }
 //     }
 //   }
 // }
@@ -137,12 +135,6 @@ function safeText(s) {
   return String(s || "").replace(/\u0000/g, "").trim();
 }
 
-function clampText(text, max = 4500) {
-  const t = safeText(text);
-  if (t.length <= max) return t;
-  return t.slice(0, max - 10) + "\n...(內容過長已截斷)";
-}
-
 function isCommand(text) {
   const t = safeText(text);
   return t.startsWith("/") || t.startsWith("／");
@@ -156,13 +148,18 @@ function normalizeCommand(text) {
 
 function toTicker(raw) {
   let t = safeText(raw).toUpperCase().trim();
+  t = t.replace(/^\/+/, ""); // 避免把 /股價 2330 之類塞進來
   if (!t) return "";
-  // 2330 -> 2330.TW
+
+  // 只輸入數字 → 台股預設 .TW
   if (/^\d+$/.test(t)) return `${t}.TW`;
-  // 2330TW -> 2330.TW
+
+  // 2330TW → 2330.TW
   if (/^\d+TW$/.test(t)) return `${t.slice(0, -2)}.TW`;
-  // 保留其它市場格式，例如 AAPL, TSLA, NVDA
-  t = t.replace(/\.TW$/i, ".TW");
+
+  // 2330.TW 保持
+  if (/^\d+\.TW$/i.test(t)) return t.replace(/\.TW$/i, ".TW");
+
   return t;
 }
 
@@ -177,6 +174,12 @@ function fmtNum(n, digits = 2) {
 function fmtInt(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
+}
+
+function clampText(text, max = 4500) {
+  const t = safeText(text);
+  if (t.length <= max) return t;
+  return t.slice(0, max - 10) + "\n...(內容過長已截斷)";
 }
 
 function nowMs() {
@@ -194,33 +197,17 @@ function markAlert(userId, ticker, type) {
   lastAlertAt.set(key, nowMs());
 }
 
-function getUserKey(event) {
-  // 群/房間也要能用
-  const src = event.source || {};
-  return src.userId || src.groupId || src.roomId || "unknown";
-}
-
 function ensureUser(userId) {
   if (!store.users[userId]) {
     store.users[userId] = {
       tickers: [],
-      prefs: { ...DEFAULT_PREFS },
-      scanEnabled: true,
+      prefs: { volumeBoost: DEFAULT_VOLUME_BOOST, lookback: DEFAULT_LOOKBACK },
     };
     saveStore();
   }
-  // 補齊 prefs 欄位
-  store.users[userId].prefs = { ...DEFAULT_PREFS, ...(store.users[userId].prefs || {}) };
-  if (typeof store.users[userId].scanEnabled !== "boolean") store.users[userId].scanEnabled = true;
-  return store.users[userId];
-}
-
-async function replyText(replyToken, text) {
-  const t = clampText(text);
-  try {
-    await client.replyMessage(replyToken, { type: "text", text: t });
-  } catch (e) {
-    console.error("replyText error:", e?.response?.data || e.message);
+  if (!store.users[userId].prefs) {
+    store.users[userId].prefs = { volumeBoost: DEFAULT_VOLUME_BOOST, lookback: DEFAULT_LOOKBACK };
+    saveStore();
   }
 }
 
@@ -248,50 +235,6 @@ function RSI(closes, period = 14) {
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
-}
-
-function supportResistance(history, lookback = 30) {
-  if (!history || history.length < lookback) return null;
-  const recent = history.slice(-lookback);
-  const support = Math.min(...recent.map((r) => r.low));
-  const resistance = Math.max(...recent.map((r) => r.high));
-  return { support, resistance, lookback };
-}
-
-// =====================
-// OpenAI Chat
-// =====================
-async function chatWithOpenAI(message) {
-  if (!OPENAI_API_KEY) return "⚠️ 未設定 OPENAI_API_KEY（Render 環境變數）";
-
-  try {
-    const response = await axios.post(
-      "https://api.openai.com/v1/responses",
-      {
-        model: "gpt-4o-mini",
-        input: [
-          {
-            role: "system",
-            content:
-              "你是專業的 AI 查詢助理。回答要清楚、可執行、中文為主。若使用者問股價、新聞、匯率等即時資訊，建議使用 /web 或 /股價 指令。",
-          },
-          { role: "user", content: String(message || "") },
-        ],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 60000,
-      }
-    );
-
-    return response.data.output_text || "（沒有取得回覆）";
-  } catch (error) {
-    console.log("OpenAI Error:", error.response?.data || error.message);
-    return "⚠️ OpenAI 連線失敗（請檢查 OPENAI_API_KEY / 權限 / 餘額）";
-  }
 }
 
 // =====================
@@ -339,6 +282,7 @@ async function fetchStooqHistory(ticker, limit = 160) {
   for (let i = 1; i < lines.length; i++) {
     const parts = lines[i].split(",").map((x) => x.trim());
     if (parts.length < 6) continue;
+
     const row = {};
     header.forEach((h, idx) => (row[h] = parts[idx]));
 
@@ -364,7 +308,11 @@ async function fetchStooqHistory(ticker, limit = 160) {
 }
 
 async function serpSearch(query) {
-  if (!SERPAPI_KEY) return null;
+  if (!SERPAPI_KEY) {
+    return [
+      { title: "⚠️ 未設定 SERPAPI_KEY", link: "請到 Render Environment 新增 SERPAPI_KEY" },
+    ];
+  }
 
   const url = "https://serpapi.com/search.json";
   const params = {
@@ -381,4 +329,59 @@ async function serpSearch(query) {
   const results = [];
   const organic = data.organic_results || [];
   for (const r of organic.slice(0, 5)) {
-    if (!r.title || !r.link
+    if (!r.title || !r.link) continue;
+    results.push({ title: r.title, link: r.link });
+  }
+  return results.length ? results : [{ title: "（沒有搜尋結果）", link: "" }];
+}
+
+// =====================
+// OpenAI (chat)
+// =====================
+async function askOpenAI(userText) {
+  if (!OPENAI_API_KEY) return "⚠️ 沒有設定 OPENAI_API_KEY（請到 Render Environment 新增）";
+
+  const url = "https://api.openai.com/v1/chat/completions";
+  const body = {
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是專業中文助理。回答要精準、可執行、不要胡亂編造。若不知道就說不知道並給替代方案。",
+      },
+      { role: "user", content: safeText(userText) },
+    ],
+    temperature: 0.4,
+  };
+
+  try {
+    const { data } = await axios.post(url, body, {
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 15000,
+    });
+
+    const text = data?.choices?.[0]?.message?.content?.trim();
+    return text ? clampText(text) : "（OpenAI 沒有回傳內容）";
+  } catch (e) {
+    const status = e?.response?.status;
+    const msg = e?.response?.data?.error?.message || e.message;
+    return `⚠️ OpenAI 呼叫失敗（${status || "no-status"}）：${msg}`;
+  }
+}
+
+// =====================
+// Stock Report (/股價)
+// =====================
+function supportResistance(history, lookback = 30) {
+  if (!history || history.length < lookback) return null;
+  const recent = history.slice(-lookback);
+  const support = Math.min(...recent.map((r) => r.low));
+  const resistance = Math.max(...recent.map((r) => r.high));
+  return { support, resistance, lookback };
+}
+
+asy
