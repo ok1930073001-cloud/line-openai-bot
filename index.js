@@ -13,26 +13,22 @@ const path = require("path");
 // =====================
 const PORT = process.env.PORT || 10000;
 
-const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN || "";
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET || "";
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-// 掃描頻率（毫秒）預設 5 分鐘
+// 5分鐘 = 300000；2分鐘 = 120000
 const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 300000);
 
-// 同一股票同一提醒的冷卻時間（避免洗版）預設 30 分鐘
+// 同一股票同一提醒冷卻（避免洗版）
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 30 * 60 * 1000);
 
-// 追蹤提醒條件：量放大倍數（預設 1.5 倍）
-const DEFAULT_VOLUME_BOOST = Number(process.env.DEFAULT_VOLUME_BOOST || 1.5);
-
-// 追蹤提醒條件：看近幾日（預設 20 日）
-const DEFAULT_LOOKBACK = Number(process.env.DEFAULT_LOOKBACK || 20);
-
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
-  console.error("Missing LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
+  console.error("❌ Missing LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
   process.exit(1);
 }
 
@@ -64,14 +60,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`LINE bot webhook listening on port ${PORT}`);
+  console.log(`✅ LINE bot webhook listening on port ${PORT}`);
 });
 
 // =====================
 // Storage (Watchlist)
 // =====================
-// Render 建議掛 Disk 到 /data（最穩）
-// 沒掛 disk 也能跑，只是重啟可能會清空
+// 建議 Render 掛 Disk 到 /data（最穩）
+// 沒掛 disk 也能跑，但重啟可能會清空
 const DATA_DIR = process.env.DATA_DIR || "/data";
 const FALLBACK_DIR = path.join(__dirname, "data");
 let STORE_DIR = DATA_DIR;
@@ -80,7 +76,7 @@ function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     return true;
-  } catch (_) {
+  } catch (e) {
     return false;
   }
 }
@@ -92,15 +88,7 @@ if (!ensureDir(STORE_DIR)) {
 
 const STORE_FILE = path.join(STORE_DIR, "watchlist.json");
 
-// store 結構：
-// {
-//   users: {
-//     "<userId>": {
-//        tickers: ["2330.TW", "AAPL"],
-//        prefs: { volumeBoost: 1.5, lookback: 20 }
-//     }
-//   }
-// }
+// store = { users: { userId: { tickers:[], prefs:{} } } }
 let store = { users: {} };
 
 // 記錄上次提醒時間： key = `${userId}::${ticker}::${type}`
@@ -148,18 +136,9 @@ function normalizeCommand(text) {
 
 function toTicker(raw) {
   let t = safeText(raw).toUpperCase().trim();
-  t = t.replace(/^\/+/, ""); // 避免把 /股價 2330 之類塞進來
-  if (!t) return "";
-
-  // 只輸入數字 → 台股預設 .TW
   if (/^\d+$/.test(t)) return `${t}.TW`;
-
-  // 2330TW → 2330.TW
   if (/^\d+TW$/.test(t)) return `${t.slice(0, -2)}.TW`;
-
-  // 2330.TW 保持
-  if (/^\d+\.TW$/i.test(t)) return t.replace(/\.TW$/i, ".TW");
-
+  t = t.replace(/\.TW$/i, ".TW");
   return t;
 }
 
@@ -179,7 +158,7 @@ function fmtInt(n) {
 function clampText(text, max = 4500) {
   const t = safeText(text);
   if (t.length <= max) return t;
-  return t.slice(0, max - 10) + "\n...(內容過長已截斷)";
+  return t.slice(0, max - 20) + "\n...(內容過長已截斷)";
 }
 
 function nowMs() {
@@ -201,14 +180,14 @@ function ensureUser(userId) {
   if (!store.users[userId]) {
     store.users[userId] = {
       tickers: [],
-      prefs: { volumeBoost: DEFAULT_VOLUME_BOOST, lookback: DEFAULT_LOOKBACK },
+      prefs: {
+        volumeBoost: 1.5,
+        lookback: 20,
+      },
     };
     saveStore();
   }
-  if (!store.users[userId].prefs) {
-    store.users[userId].prefs = { volumeBoost: DEFAULT_VOLUME_BOOST, lookback: DEFAULT_LOOKBACK };
-    saveStore();
-  }
+  return store.users[userId];
 }
 
 // =====================
@@ -235,6 +214,14 @@ function RSI(closes, period = 14) {
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
+}
+
+function supportResistance(history, lookback = 30) {
+  if (!history || history.length < lookback) return null;
+  const recent = history.slice(-lookback);
+  const support = Math.min(...recent.map((r) => r.low));
+  const resistance = Math.max(...recent.map((r) => r.high));
+  return { support, resistance, lookback };
 }
 
 // =====================
@@ -308,11 +295,7 @@ async function fetchStooqHistory(ticker, limit = 160) {
 }
 
 async function serpSearch(query) {
-  if (!SERPAPI_KEY) {
-    return [
-      { title: "⚠️ 未設定 SERPAPI_KEY", link: "請到 Render Environment 新增 SERPAPI_KEY" },
-    ];
-  }
+  if (!SERPAPI_KEY) return null;
 
   const url = "https://serpapi.com/search.json";
   const params = {
@@ -332,56 +315,74 @@ async function serpSearch(query) {
     if (!r.title || !r.link) continue;
     results.push({ title: r.title, link: r.link });
   }
-  return results.length ? results : [{ title: "（沒有搜尋結果）", link: "" }];
+  return results;
 }
 
 // =====================
-// OpenAI (chat)
+// OpenAI (Responses API)
 // =====================
-async function askOpenAI(userText) {
-  if (!OPENAI_API_KEY) return "⚠️ 沒有設定 OPENAI_API_KEY（請到 Render Environment 新增）";
+function extractResponseText(respData) {
+  // responses api: { output: [...] } 也可能有 output_text
+  if (!respData) return "";
+  if (typeof respData.output_text === "string") return respData.output_text;
 
-  const url = "https://api.openai.com/v1/chat/completions";
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content:
-          "你是專業中文助理。回答要精準、可執行、不要胡亂編造。若不知道就說不知道並給替代方案。",
-      },
-      { role: "user", content: safeText(userText) },
-    ],
-    temperature: 0.4,
-  };
-
+  // 兼容解析 output -> content -> text
   try {
-    const { data } = await axios.post(url, body, {
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      timeout: 15000,
-    });
-
-    const text = data?.choices?.[0]?.message?.content?.trim();
-    return text ? clampText(text) : "（OpenAI 沒有回傳內容）";
+    const out = respData.output || [];
+    let texts = [];
+    for (const item of out) {
+      const content = item.content || [];
+      for (const c of content) {
+        if (c.type === "output_text" && c.text) texts.push(c.text);
+        if (c.type === "text" && c.text) texts.push(c.text);
+      }
+    }
+    return texts.join("\n").trim();
   } catch (e) {
-    const status = e?.response?.status;
-    const msg = e?.response?.data?.error?.message || e.message;
-    return `⚠️ OpenAI 呼叫失敗（${status || "no-status"}）：${msg}`;
+    return "";
   }
 }
 
-// =====================
-// Stock Report (/股價)
-// =====================
-function supportResistance(history, lookback = 30) {
-  if (!history || history.length < lookback) return null;
-  const recent = history.slice(-lookback);
-  const support = Math.min(...recent.map((r) => r.low));
-  const resistance = Math.max(...recent.map((r) => r.high));
-  return { support, resistance, lookback };
+async function openaiReply(userText) {
+  if (!OPENAI_API_KEY) {
+    return "⚠️ 尚未設定 OPENAI_API_KEY，所以我無法用 OpenAI 回答。\n請到 Render → Environment 加上 OPENAI_API_KEY 後重新部署。";
+  }
+
+  const system = [
+    "你是一個專業的即時查詢助理。",
+    "回覆請用繁體中文、清楚條列、不要廢話。",
+    "如果使用者問股價/新聞，可以建議使用 /股價 或 /web 指令。",
+  ].join("\n");
+
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [
+      { role: "system", content: system },
+      { role: "user", content: userText },
+    ],
+  };
+
+  const { data } = await axios.post("https://api.openai.com/v1/responses", payload, {
+    timeout: 25000,
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  const text = extractResponseText(data);
+  return text ? text : "（沒有取得回覆內容）";
 }
 
-async
+// =====================
+// Stock Report (for /股價)
+// =====================
+async function getStockReport(rawTicker) {
+  const ticker = toTicker(rawTicker);
+
+  const quote = await fetchStooqQuote(ticker);
+  if (!quote) {
+    return `⚠️ 無法取得股價資料：${ticker}\n你可再試：/股價 2330 或 /web ${ticker} 股價`;
+  }
+
+  const hist
