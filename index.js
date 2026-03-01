@@ -25,6 +25,13 @@ const SCAN_INTERVAL_MS = Number(process.env.SCAN_INTERVAL_MS || 300000);
 // 同一股票同一種提醒冷卻（避免洗版）
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 30 * 60 * 1000);
 
+// 技術判斷預設
+const DEFAULT_PREFS = {
+  volumeBoost: 1.5, // 成交量 > 近20日均量 * 1.5
+  lookback: 30,     // 支撐壓力回看天數
+  breakoutPct: 0.0  // 突破壓力要加多少%(0=只要突破就算)
+};
+
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.error("Missing LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
   process.exit(1);
@@ -66,7 +73,7 @@ app.listen(PORT, () => {
 // =====================
 // 建議 Render 掛 Disk 到 /data（最穩）
 // 沒掛 disk 也能跑，只是重啟可能會清空
-const DATA_DIR = process.env.DATA_DIR || "/data"; // 若沒掛 disk 也沒關係，會 fallback
+const DATA_DIR = process.env.DATA_DIR || "/data";
 const FALLBACK_DIR = path.join(__dirname, "data");
 let STORE_DIR = DATA_DIR;
 
@@ -89,9 +96,10 @@ const STORE_FILE = path.join(STORE_DIR, "watchlist.json");
 // 結構：
 // {
 //   users: {
-//     "<userId>": {
+//     "<id>": {
 //        tickers: ["2330.TW", "AAPL"],
-//        prefs: { volumeBoost: 1.5, lookback: 20 }
+//        prefs: { volumeBoost: 1.5, lookback: 30, breakoutPct: 0 },
+//        scanEnabled: true
 //     }
 //   }
 // }
@@ -129,6 +137,12 @@ function safeText(s) {
   return String(s || "").replace(/\u0000/g, "").trim();
 }
 
+function clampText(text, max = 4500) {
+  const t = safeText(text);
+  if (t.length <= max) return t;
+  return t.slice(0, max - 10) + "\n...(內容過長已截斷)";
+}
+
 function isCommand(text) {
   const t = safeText(text);
   return t.startsWith("/") || t.startsWith("／");
@@ -142,8 +156,12 @@ function normalizeCommand(text) {
 
 function toTicker(raw) {
   let t = safeText(raw).toUpperCase().trim();
+  if (!t) return "";
+  // 2330 -> 2330.TW
   if (/^\d+$/.test(t)) return `${t}.TW`;
+  // 2330TW -> 2330.TW
   if (/^\d+TW$/.test(t)) return `${t.slice(0, -2)}.TW`;
+  // 保留其它市場格式，例如 AAPL, TSLA, NVDA
   t = t.replace(/\.TW$/i, ".TW");
   return t;
 }
@@ -161,12 +179,6 @@ function fmtInt(n) {
   return Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
-function clampText(text, max = 4500) {
-  const t = safeText(text);
-  if (t.length <= max) return t;
-  return t.slice(0, max - 10) + "\n...(內容過長已截斷)";
-}
-
 function nowMs() {
   return Date.now();
 }
@@ -180,6 +192,36 @@ function canAlert(userId, ticker, type) {
 function markAlert(userId, ticker, type) {
   const key = `${userId}::${ticker}::${type}`;
   lastAlertAt.set(key, nowMs());
+}
+
+function getUserKey(event) {
+  // 群/房間也要能用
+  const src = event.source || {};
+  return src.userId || src.groupId || src.roomId || "unknown";
+}
+
+function ensureUser(userId) {
+  if (!store.users[userId]) {
+    store.users[userId] = {
+      tickers: [],
+      prefs: { ...DEFAULT_PREFS },
+      scanEnabled: true,
+    };
+    saveStore();
+  }
+  // 補齊 prefs 欄位
+  store.users[userId].prefs = { ...DEFAULT_PREFS, ...(store.users[userId].prefs || {}) };
+  if (typeof store.users[userId].scanEnabled !== "boolean") store.users[userId].scanEnabled = true;
+  return store.users[userId];
+}
+
+async function replyText(replyToken, text) {
+  const t = clampText(text);
+  try {
+    await client.replyMessage(replyToken, { type: "text", text: t });
+  } catch (e) {
+    console.error("replyText error:", e?.response?.data || e.message);
+  }
 }
 
 // =====================
@@ -206,6 +248,50 @@ function RSI(closes, period = 14) {
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
+}
+
+function supportResistance(history, lookback = 30) {
+  if (!history || history.length < lookback) return null;
+  const recent = history.slice(-lookback);
+  const support = Math.min(...recent.map((r) => r.low));
+  const resistance = Math.max(...recent.map((r) => r.high));
+  return { support, resistance, lookback };
+}
+
+// =====================
+// OpenAI Chat
+// =====================
+async function chatWithOpenAI(message) {
+  if (!OPENAI_API_KEY) return "⚠️ 未設定 OPENAI_API_KEY（Render 環境變數）";
+
+  try {
+    const response = await axios.post(
+      "https://api.openai.com/v1/responses",
+      {
+        model: "gpt-4o-mini",
+        input: [
+          {
+            role: "system",
+            content:
+              "你是專業的 AI 查詢助理。回答要清楚、可執行、中文為主。若使用者問股價、新聞、匯率等即時資訊，建議使用 /web 或 /股價 指令。",
+          },
+          { role: "user", content: String(message || "") },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 60000,
+      }
+    );
+
+    return response.data.output_text || "（沒有取得回覆）";
+  } catch (error) {
+    console.log("OpenAI Error:", error.response?.data || error.message);
+    return "⚠️ OpenAI 連線失敗（請檢查 OPENAI_API_KEY / 權限 / 餘額）";
+  }
 }
 
 // =====================
@@ -239,7 +325,7 @@ async function fetchStooqQuote(ticker) {
   };
 }
 
-async function fetchStooqHistory(ticker, limit = 140) {
+async function fetchStooqHistory(ticker, limit = 160) {
   const s = ticker.toLowerCase();
   const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`;
   const { data } = await axios.get(url, { timeout: 20000 });
@@ -295,79 +381,4 @@ async function serpSearch(query) {
   const results = [];
   const organic = data.organic_results || [];
   for (const r of organic.slice(0, 5)) {
-    if (!r.title || !r.link) continue;
-    results.push({ title: r.title, link: r.link });
-  }
-  return results;
-}
-
-// =====================
-// Stock Report (for /股價)
-// =====================
-function supportResistance(history, lookback = 30) {
-  if (!history || history.length < lookback) return null;
-  const recent = history.slice(-lookback);
-  const support = Math.min(...recent.map((r) => r.low));
-  const resistance = Math.max(...recent.map((r) => r.high));
-  return { support, resistance, lookback };
-}
-
-async function getStockReport(rawTicker) {
-  const ticker = toTicker(rawTicker);
-
-  const quote = await fetchStooqQuote(ticker);
-  if (!quote) {
-    return `⚠️ 無法取得股價資料：${ticker}\n你可再試：/股價 2330 或 /web ${ticker} 股價`;
-  }
-
-  const history = await fetchStooqHistory(ticker, 160);
-  if (!history || history.length < 40) {
-    return [
-      `📌 ${ticker} 最近收盤`,
-      `收盤：${fmtNum(quote.close)}  開：${fmtNum(quote.open)}  高：${fmtNum(quote.high)}  低：${fmtNum(quote.low)}`,
-      `量：${fmtInt(quote.volume)}  時間：${quote.date} ${quote.time}`,
-      `（技術分析資料不足）`,
-    ].join("\n");
-  }
-
-  const closes = history.map((r) => r.close);
-  const vols = history.map((r) => r.volume);
-  const last = history[history.length - 1];
-  const prev = history[history.length - 2];
-
-  const chg = last.close - prev.close;
-  const chgPct = (chg / prev.close) * 100;
-
-  const ma5 = SMA(closes, 5);
-  const ma20 = SMA(closes, 20);
-  const ma60 = SMA(closes, 60);
-  const rsi14 = RSI(closes, 14);
-
-  const sr = supportResistance(history, 30);
-
-  const lines = [];
-  lines.push(`📈 股價分析｜${ticker}`);
-  lines.push(`時間：${quote.date} ${quote.time}`);
-  lines.push(
-    `收盤/現價：${fmtNum(quote.close)}（較前日 ${chg >= 0 ? "▲" : "▼"}${fmtNum(chg)} / ${fmtNum(chgPct, 2)}%）`
-  );
-  lines.push(`區間：高 ${fmtNum(quote.high)}｜低 ${fmtNum(quote.low)}｜開 ${fmtNum(quote.open)}｜量 ${fmtInt(quote.volume)}`);
-  lines.push("");
-  lines.push(`MA5：${fmtNum(ma5)}  MA20：${fmtNum(ma20)}  MA60：${fmtNum(ma60)}`);
-  lines.push(`RSI14：${fmtNum(rsi14, 1)}`);
-
-  // 量能提示（近20日平均）
-  const avg20Vol = SMA(vols, 20);
-  if (avg20Vol) {
-    const volRatio = quote.volume / avg20Vol;
-    lines.push(`量能：今日/近20均量 = ${fmtNum(volRatio, 2)}x`);
-  }
-
-  if (sr) {
-    lines.push("");
-    lines.push(`近${sr.lookback}日支撐/壓力（粗估）`);
-    lines.push(`支撐：約 ${fmtNum(sr.support)}  ｜ 壓力：約 ${fmtNum(sr.resistance)}`);
-  }
-
-  lines.push("");
-  lines.push("指令：/追蹤 
+    if (!r.title || !r.link
