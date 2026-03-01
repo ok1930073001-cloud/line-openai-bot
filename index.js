@@ -1,347 +1,392 @@
+/**
+ * LINE 專業版 AI 查詢系統（可直接整份覆蓋 index.js）
+ * 功能：
+ *  - 一般聊天：走 OpenAI
+ *  - /web 查網頁（SerpApi，可選）
+ *  - /追蹤 台股/美股 監控（Yahoo + Stooq 備援）
+ *  - /清單 查看追蹤清單
+ *  - /股價 查股價
+ *  - /提醒 設提醒（分鐘/小時/指定時間）
+ *  - /提醒清單 /取消提醒
+ *
+ * 需要 Render 環境變數：
+ *  - LINE_ACCESS_TOKEN
+ *  - LINE_CHANNEL_SECRET
+ *  - OPENAI_API_KEY
+ * 可選：
+ *  - SERPAPI_KEY   (開啟 /web 即時查詢網頁；沒有也能聊天與股價)
+ */
+
+"use strict";
+
+require("dotenv").config();
+
 const express = require("express");
 const line = require("@line/bot-sdk");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const app = express();
+// ===================== Config =====================
 const PORT = process.env.PORT || 10000;
 
-// ====== LINE Config ======
+const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const SERPAPI_KEY = process.env.SERPAPI_KEY || "";
+
+// 監控設定
+const TZ_OFFSET_HOURS = 8; // 台灣 UTC+8
+const WATCH_CHECK_MS = 2 * 60 * 1000; // 每 2 分鐘檢查一次（Render free 可能休眠）
+const WATCH_ALERT_PCT = 1.5; // 漲跌超過 1.5% 推播
+const REMINDER_TICK_MS = 30 * 1000; // 每 30 秒掃描提醒
+
+// 台灣常用公司名對照（你可自行加）
+const TW_NAME_MAP = {
+  "台積電": "2330.TW",
+  "tsmc": "2330.TW",
+  "聯發科": "2454.TW",
+  "鴻海": "2317.TW",
+  "富邦金": "2881.TW",
+  "國泰金": "2882.TW",
+  "中華電": "2412.TW",
+  "台達電": "2308.TW",
+};
+
+// ===================== Safety checks =====================
+if (!LINE_ACCESS_TOKEN) throw new Error("Missing LINE_ACCESS_TOKEN");
+if (!LINE_CHANNEL_SECRET) throw new Error("Missing LINE_CHANNEL_SECRET");
+if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+// LINE client
 const config = {
-  channelAccessToken: process.env.LINE_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
+  channelAccessToken: LINE_ACCESS_TOKEN,
+  channelSecret: LINE_CHANNEL_SECRET,
 };
 const client = new line.Client(config);
 
-// ====== Settings (你可調整) ======
-const TZ_OFFSET_HOURS = 8;                 // Taiwan UTC+8
-const WATCH_CHECK_MS = 2 * 60 * 1000;      // 追蹤輪詢頻率：2分鐘
-const WATCH_ALERT_PCT = 1.5;               // 漲跌幅 >= 1.5% 推播（可改）
-const REMINDER_TICK_MS = 3000;             // 提醒檢查：3秒
+// Express
+const app = express();
 
-// ====== State Persistence ======
-const STATE_FILE = path.join(__dirname, "bot_state.json");
-/**
- * state schema:
- * {
- *   watchlists: { [toId]: { items: [{symbol,name}], last: { [symbol]: {price, ts} } } },
- *   reminders:  { [toId]: [{ id, atMs, text, createdMs }] }
- * }
- */
-let state = loadState();
+// ===================== Persistence =====================
+const DATA_PATH = path.join(__dirname, "data.json");
+
+const state = {
+  users: {
+    // userId: { watch: { "2330.TW": { lastPrice, lastNotifiedPrice, lastCheckedMs } }, reminders: [ ... ] }
+  },
+};
 
 function loadState() {
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, "utf8");
-      const parsed = JSON.parse(raw);
-      return {
-        watchlists: parsed.watchlists || {},
-        reminders: parsed.reminders || {},
-      };
+    if (fs.existsSync(DATA_PATH)) {
+      const raw = fs.readFileSync(DATA_PATH, "utf8");
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === "object") {
+        if (obj.users && typeof obj.users === "object") state.users = obj.users;
+      }
     }
   } catch (e) {
-    console.error("loadState error:", e);
-  }
-  return { watchlists: {}, reminders: {} };
-}
-
-function saveState() {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
-  } catch (e) {
-    console.error("saveState error:", e);
+    console.error("Failed to load data.json:", e?.message || e);
   }
 }
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.writeFileSync(DATA_PATH, JSON.stringify(state, null, 2), "utf8");
+    } catch (e) {
+      console.error("Failed to save data.json:", e?.message || e);
+    }
+  }, 600);
+}
+function ensureUser(userId) {
+  if (!state.users[userId]) state.users[userId] = { watch: {}, reminders: [] };
+  return state.users[userId];
+}
 
-// ====== Helpers ======
+loadState();
+
+// ===================== Helpers =====================
 function safeText(s) {
-  return String(s ?? "").replace(/\u0000/g, "").trim();
-}
-
-function isCommand(text) {
-  return text.startsWith("/") || text.startsWith("／");
-}
-function stripCommandPrefix(text) {
-  return safeText(text).replace(/^[/／]\s*/, "");
-}
-
-function chunkText(text, max = 4000) {
-  const s = safeText(text);
-  if (s.length <= max) return s;
-  return s.slice(0, max - 1) + "…";
-}
-
-async function reply(token, text) {
-  return client.replyMessage(token, { type: "text", text: chunkText(text) });
-}
-
-async function push(to, text) {
-  try {
-    await client.pushMessage(to, { type: "text", text: chunkText(text) });
-  } catch (e) {
-    console.error("push error:", e?.message || e);
-  }
-}
-
-function getToId(event) {
-  // 優先推到群/房（如果是在群/房）不然推到 userId
-  const src = event?.source || {};
-  return src.groupId || src.roomId || src.userId || null;
-}
-
-// Taiwan time parsing (把「台灣時間」轉 epoch ms)
-function makeTaipeiEpoch(y, m, d, hh, mm) {
-  // 將「台灣時間」轉成 UTC epoch：UTC = 台灣時間 - 8 小時
-  return Date.UTC(y, m - 1, d, hh - TZ_OFFSET_HOURS, mm, 0, 0);
+  return String(s || "").replace(/\u0000/g, "").trim();
 }
 
 function nowMs() {
   return Date.now();
 }
 
-// ====== Yahoo Finance: Symbol Resolve + Quote ======
-async function resolveSymbol(query) {
-  const q = safeText(query);
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function toTaipeiDate(ms) {
+  // 轉成台灣時間（不依賴伺服器時區）
+  const d = new Date(ms + TZ_OFFSET_HOURS * 3600 * 1000);
+  return d;
+}
+
+function formatTaipei(ms) {
+  const d = toTaipeiDate(ms);
+  const y = d.getUTCFullYear();
+  const m = pad2(d.getUTCMonth() + 1);
+  const dd = pad2(d.getUTCDate());
+  const hh = pad2(d.getUTCHours());
+  const mm = pad2(d.getUTCMinutes());
+  return `${y}-${m}-${dd} ${hh}:${mm}`;
+}
+
+function percentDiff(a, b) {
+  if (typeof a !== "number" || typeof b !== "number" || a === 0) return 0;
+  return ((b - a) / a) * 100;
+}
+
+function normalizeSymbol(input) {
+  const q = safeText(input);
   if (!q) return null;
 
-  // 台股代碼
-  if (/^\d{4,6}$/.test(q)) return `${q}.TW`;
+  // 命中中文別名
+  const hit = TW_NAME_MAP[q] || TW_NAME_MAP[q.toLowerCase()];
+  if (hit) return hit;
 
-  // 美股/常見代碼
-  if (/^[A-Za-z.\-^=]{1,15}$/.test(q)) return q.toUpperCase();
+  // 2330 -> 2330.TW（台股常用）
+  if (/^\d{4}$/.test(q)) return `${q}.TW`;
 
-  // 中文/公司名 -> Yahoo search
-  try {
-    const url = "https://query2.finance.yahoo.com/v1/finance/search";
-    const resp = await axios.get(url, { params: { q, quotesCount: 6, newsCount: 0 }, timeout: 15000 });
-    const quotes = resp.data?.quotes || [];
-    const preferred = quotes.find((x) => ["EQUITY", "ETF"].includes(x.quoteType));
-    const best = preferred || quotes[0];
-    return best?.symbol || null;
-  } catch {
-    return null;
-  }
-}
-
-async function getQuote(symbol) {
-  try {
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
-    const resp = await axios.get(url, { timeout: 15000 });
-    const data = resp.data?.quoteResponse?.result?.[0];
-    if (!data) return null;
-
-    return {
-      symbol: data.symbol,
-      name: data.longName || data.shortName || data.symbol,
-      price: data.regularMarketPrice,
-      change: data.regularMarketChange,
-      percent: data.regularMarketChangePercent,
-      currency: data.currency || "",
-      marketState: data.marketState || "",
-      ts: data.regularMarketTime ? data.regularMarketTime * 1000 : Date.now(),
-    };
-  } catch {
-    return null;
-  }
-}
-
-// ====== GPT (Responses API) ======
-async function askGPT(input) {
-  try {
-    const resp = await axios.post(
-      "https://api.openai.com/v1/responses",
-      { model: "gpt-4.1-mini", input },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 30000,
-      }
-    );
-    return resp.data?.output_text?.trim() || "（沒有取得回覆）";
-  } catch {
-    return "⚠️ GPT 發生錯誤（請確認 OPENAI_API_KEY / 方案餘額 / 服務狀態）";
-  }
-}
-
-// ====== Reminder Time Parser ======
-/**
- * 支援：
- *  - 10m / 2h / 1d
- *  - 30分鐘後 / 1小時後 / 2天後
- *  - 明天 09:00 / 今天 18:30 / 今晚 9點
- *  - 3/5 14:30（預設今年）
- *  - 2026/03/05 14:30 or 2026-03-05 14:30
- */
-function parseReminderTime(input) {
-  const s = safeText(input);
-  if (!s) return null;
-
-  const now = new Date();
-  const nowY = now.getUTCFullYear(); // 用 UTC year，但我們會用台灣時間計算 epoch
-  const baseMs = nowMs();
-
-  // 10m / 2h / 1d
-  let m = s.match(/^(\d+)\s*(m|min|分鐘|h|hr|小時|d|天)\s*(後)?$/i);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    const unit = m[2].toLowerCase();
-    let add = 0;
-    if (unit === "m" || unit === "min" || unit === "分鐘") add = n * 60 * 1000;
-    else if (unit === "h" || unit === "hr" || unit === "小時") add = n * 60 * 60 * 1000;
-    else if (unit === "d" || unit === "天") add = n * 24 * 60 * 60 * 1000;
-    return baseMs + add;
-  }
-
-  // 30分鐘後 / 1小時後 / 2天後
-  m = s.match(/^(\d+)\s*(分鐘|小時|天)\s*後$/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    const unit = m[2];
-    let add = 0;
-    if (unit === "分鐘") add = n * 60 * 1000;
-    if (unit === "小時") add = n * 60 * 60 * 1000;
-    if (unit === "天") add = n * 24 * 60 * 60 * 1000;
-    return baseMs + add;
-  }
-
-  // 明天/今天/今晚 + 時間
-  // 明天 09:00 / 今天 18:30 / 今晚 9點 / 明天9點
-  m = s.match(/^(今天|明天|今晚)\s*(\d{1,2})(?:[:：](\d{2}))?\s*(點)?$/);
-  if (m) {
-    const dayWord = m[1];
-    let hh = parseInt(m[2], 10);
-    let mm = m[3] ? parseInt(m[3], 10) : 0;
-    if (dayWord === "今晚" && hh < 12) hh += 12;
-
-    // 取「台灣日期」
-    const taipeiNow = new Date(baseMs + TZ_OFFSET_HOURS * 3600 * 1000);
-    let y = taipeiNow.getUTCFullYear();
-    let mon = taipeiNow.getUTCMonth() + 1;
-    let d = taipeiNow.getUTCDate();
-
-    if (dayWord === "明天") {
-      const t = new Date(makeTaipeiEpoch(y, mon, d, 0, 0) + 24 * 3600 * 1000);
-      y = t.getUTCFullYear();
-      mon = t.getUTCMonth() + 1;
-      d = t.getUTCDate();
-    }
-    return makeTaipeiEpoch(y, mon, d, hh, mm);
-  }
-
-  // 3/5 14:30（預設今年）
-  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})\s+(\d{1,2})(?:[:：](\d{2}))$/);
-  if (m) {
-    const mon = parseInt(m[1], 10);
-    const d = parseInt(m[2], 10);
-    const hh = parseInt(m[3], 10);
-    const mm = parseInt(m[4], 10);
-    // 用台灣當下年份
-    const taipeiNow = new Date(baseMs + TZ_OFFSET_HOURS * 3600 * 1000);
-    const y = taipeiNow.getUTCFullYear();
-    return makeTaipeiEpoch(y, mon, d, hh, mm);
-  }
-
-  // 2026/03/05 14:30 or 2026-03-05 14:30
-  m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\s+(\d{1,2})(?:[:：](\d{2}))$/);
-  if (m) {
-    const y = parseInt(m[1], 10);
-    const mon = parseInt(m[2], 10);
-    const d = parseInt(m[3], 10);
-    const hh = parseInt(m[4], 10);
-    const mm = parseInt(m[5], 10);
-    return makeTaipeiEpoch(y, mon, d, hh, mm);
+  // 已包含 .TW / .TWO / .US / .HK 等
+  if (/^[A-Za-z0-9.\-]+$/.test(q)) {
+    // 大寫比較好看
+    return q.toUpperCase();
   }
 
   return null;
 }
 
-function formatTaipeiTime(epochMs) {
-  // 以台灣時間顯示：epoch + 8h 再用 UTC 格式輸出
-  const t = new Date(epochMs + TZ_OFFSET_HOURS * 3600 * 1000);
-  const y = t.getUTCFullYear();
-  const m = String(t.getUTCMonth() + 1).padStart(2, "0");
-  const d = String(t.getUTCDate()).padStart(2, "0");
-  const hh = String(t.getUTCHours()).padStart(2, "0");
-  const mm = String(t.getUTCMinutes()).padStart(2, "0");
-  return `${y}-${m}-${d} ${hh}:${mm}（台灣）`;
+function isCommand(text) {
+  return safeText(text).startsWith("/");
 }
 
-function genId(prefix = "R") {
-  return `${prefix}${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+function needsWebSearch(text) {
+  const t = safeText(text).toLowerCase();
+  const keywords = [
+    "最新",
+    "新聞",
+    "現在",
+    "查詢",
+    "搜尋",
+    "web",
+    "資料",
+    "匯率",
+    "天氣",
+    "股價",
+    "價格",
+    "幾點",
+    "哪裡",
+  ];
+  return keywords.some((k) => t.includes(k));
 }
 
-// ====== Watchlist / Reminder Commands ======
-function ensureWatchlist(to) {
-  if (!state.watchlists[to]) state.watchlists[to] = { items: [], last: {} };
-  return state.watchlists[to];
-}
-function ensureReminders(to) {
-  if (!state.reminders[to]) state.reminders[to] = [];
-  return state.reminders[to];
-}
+function parseDurationToMs(token) {
+  // 支援：10m / 2h / 1d / 30分鐘 / 2小時 / 1天
+  const t = safeText(token).toLowerCase();
+  if (!t) return null;
 
-async function cmdWatchAdd(to, query) {
-  if (!query) return "用法：/追蹤 台積電 或 /追蹤 2330 或 /追蹤 AAPL";
+  let m = t.match(/^(\d+)\s*(m|min|分鐘)$/);
+  if (m) return Number(m[1]) * 60 * 1000;
 
-  const symbol = await resolveSymbol(query);
-  if (!symbol) return `⚠️ 找不到「${query}」對應代碼`;
+  m = t.match(/^(\d+)\s*(h|hr|hour|小時)$/);
+  if (m) return Number(m[1]) * 60 * 60 * 1000;
 
-  const q = await getQuote(symbol);
-  const name = q?.name || query;
+  m = t.match(/^(\d+)\s*(d|day|天)$/);
+  if (m) return Number(m[1]) * 24 * 60 * 60 * 1000;
 
-  const wl = ensureWatchlist(to);
-  const exists = wl.items.some((x) => x.symbol === symbol);
-  if (exists) return `✅ 已在追蹤清單：${name}（${symbol}）`;
+  // 只有數字：預設分鐘
+  m = t.match(/^(\d+)$/);
+  if (m) return Number(m[1]) * 60 * 1000;
 
-  wl.items.push({ symbol, name });
-  // 初始化 last price
-  if (q?.price != null) wl.last[symbol] = { price: q.price, ts: q.ts || Date.now() };
-
-  saveState();
-  return `✅ 已加入追蹤：${name}（${symbol}）\n（漲跌幅 ≥ ${WATCH_ALERT_PCT}% 會自動推播）`;
+  return null;
 }
 
-function cmdWatchList(to) {
-  const wl = ensureWatchlist(to);
-  if (!wl.items.length) {
-    return "（追蹤清單是空的）\n用法：/追蹤 台積電";
+function parseTaipeiTimeToMs(spec) {
+  // 支援：HH:MM（今天/明天如果已過）
+  // 支援：明天 HH:MM
+  // 支援：YYYY-MM-DD HH:MM
+  const s = safeText(spec);
+  if (!s) return null;
+
+  // YYYY-MM-DD HH:MM
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const y = Number(m[1]);
+    const mo = Number(m[2]);
+    const d = Number(m[3]);
+    const hh = Number(m[4]);
+    const mm = Number(m[5]);
+    // 轉成 UTC ms：台北時間 = UTC+8
+    const utcMs = Date.UTC(y, mo - 1, d, hh - TZ_OFFSET_HOURS, mm, 0, 0);
+    return utcMs;
   }
-  const lines = wl.items.map((x, i) => `${i + 1}. ${x.name}（${x.symbol}）`);
-  return `📌 追蹤清單（共 ${wl.items.length} 檔）\n` + lines.join("\n");
+
+  // 明天 HH:MM
+  m = s.match(/^明天\s*(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    const now = toTaipeiDate(nowMs());
+    const y = now.getUTCFullYear();
+    const mo = now.getUTCMonth();
+    const d = now.getUTCDate() + 1;
+    return Date.UTC(y, mo, d, hh - TZ_OFFSET_HOURS, mm, 0, 0);
+  }
+
+  // HH:MM（今天或明天）
+  m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (m) {
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    const now = toTaipeiDate(nowMs());
+    const y = now.getUTCFullYear();
+    const mo = now.getUTCMonth();
+    const d = now.getUTCDate();
+
+    let target = Date.UTC(y, mo, d, hh - TZ_OFFSET_HOURS, mm, 0, 0);
+    // 如果今天已過，就排明天
+    if (target <= nowMs()) {
+      target = Date.UTC(y, mo, d + 1, hh - TZ_OFFSET_HOURS, mm, 0, 0);
+    }
+    return target;
+  }
+
+  return null;
 }
 
-function cmdWatchRemove(to, query) {
-  if (!query) return "用法：/取消追蹤 台積電 或 /取消追蹤 2330.TW";
-  const wl = ensureWatchlist(to);
+// ===================== Web Search (SerpApi) =====================
+async function webSearch(query) {
   const q = safeText(query);
+  if (!q) return { ok: false, error: "空白查詢" };
 
-  // 允許用 symbol 或 name 片段移除
-  const idx = wl.items.findIndex(
-    (x) => x.symbol.toUpperCase() === q.toUpperCase() || x.name.includes(q)
-  );
-  if (idx === -1) return `⚠️ 找不到要移除的追蹤：「${q}」`;
+  if (!SERPAPI_KEY) {
+    return {
+      ok: false,
+      error: "未設定 SERPAPI_KEY（請到 Render Environment 加上 SERPAPI_KEY 才能啟用 /web 即時查詢）",
+    };
+  }
 
-  const removed = wl.items.splice(idx, 1)[0];
-  delete wl.last[removed.symbol];
-  saveState();
-  return `✅ 已取消追蹤：${removed.name}（${removed.symbol}）`;
+  try {
+    const url = "https://serpapi.com/search.json";
+    const resp = await axios.get(url, {
+      timeout: 20000,
+      params: {
+        engine: "google",
+        q,
+        hl: "zh-tw",
+        gl: "tw",
+        num: 5,
+        api_key: SERPAPI_KEY,
+      },
+    });
+
+    const results = [];
+    const organic = resp.data?.organic_results || [];
+    for (const r of organic.slice(0, 5)) {
+      results.push({
+        title: safeText(r.title),
+        snippet: safeText(r.snippet),
+        link: safeText(r.link),
+      });
+    }
+
+    if (results.length === 0) return { ok: false, error: "查無結果或來源限制" };
+    return { ok: true, results };
+  } catch (e) {
+    return { ok: false, error: e?.message || "webSearch 失敗" };
+  }
 }
 
-function cmdReminderAdd(to, timeStr, text) {
-  const atMs = parseReminderTime(timeStr);
-  if (!atMs) {
-    return (
-      "⚠️ 時間格式看不懂\n" +
-      "可用：\n" +
-      "1) /提醒 30分鐘後 喝水\n" +
-      "2) /提醒 2h 站起來走走\n" +
-      "3) /提醒 明天 09:00 開會\n" +
-      "4) /提醒 2026-03-05 14:30 回報"
-    );
+// ===================== Stock Quote (Yahoo + Stooq fallback) =====================
+async function getQuote(symbol) {
+  // 1) Yahoo Finance (primary)
+  try {
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}`;
+    const resp = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        Accept: "application/json,text/plain,*/*",
+        Referer: "https://finance.yahoo.com/",
+      },
+    });
+
+    const data = resp.data?.quoteResponse?.result?.[0];
+    if (data && typeof data.regularMarketPrice === "number") {
+      return {
+        symbol: data.symbol,
+        name: data.longName || data.shortName || data.symbol,
+        price: data.regularMarketPrice,
+        change: data.regularMarketChange,
+        percent: data.regularMarketChangePercent,
+        currency: data.currency || "",
+        marketState: data.marketState || "",
+        ts: data.regularMarketTime ? data.regularMarketTime * 1000 : Date.now(),
+      };
+    }
+  } catch (e) {
+    // ignore and fallback
+  }
+
+  // 2) Stooq fallback (secondary)
+  try {
+    // Stooq：台股用 2330.tw；美股 AAPL.us
+    let stooqSymbol = symbol.toLowerCase();
+    if (stooqSymbol.endsWith(".tw")) stooqSymbol = stooqSymbol.replace(".tw", ".tw");
+    const url = `https://stooq.com/q/l/?s=${encodeURIComponent(stooqSymbol)}&i=d`;
+    const r = await axios.get(url, { timeout: 15000 });
+
+    const lines = String(r.data || "").trim().split("\n");
+    if (lines.length >= 2) {
+      const headers = lines[0].split(",");
+      const values = lines[1].split(",");
+      const map = {};
+      headers.forEach((h, i) => (map[h.trim()] = (values[i] || "").trim()));
+
+      const close = Number(map["Close"]);
+      const name = map["Name"] || symbol;
+
+      if (!Number.isNaN(close) && close > 0) {
+        return {
+          symbol,
+          name,
+          price: close,
+          change: null,
+          percent: null,
+          currency: "",
+          marketState: "",
+          ts: Date.now(),
+        };
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  return null;
+}
+
+// ===================== OpenAI =====================
+async function askOpenAI(userText, webContext) {
+  const text = safeText(userText);
+  if (!text) return "你剛剛沒有輸入內容喔。";
+
+  // 建議：把 webContext（若有）塞進 input
+  const system = [
+    "你是一個專業的『即時查詢 + 助理』。",
+    "回覆請用繁體中文，語氣自然、清楚、條列為主。",
+    "如果使用者問的是即時資訊（新聞、股價、匯率、天氣等），優先用我提供的『網頁搜尋摘要』回答；不足時再說明限制。",
+    "如果使用者在問提醒/追蹤指令，請提示正確指令用法（例如 /提醒、/追蹤）。",
+  ].join("\n");
+
+  let input = `【使用者問題】\n${text}\n`;
   }
   if (!text) return "⚠️ 請加上提醒內容，例如：/提醒 30分鐘後 喝水";
 
