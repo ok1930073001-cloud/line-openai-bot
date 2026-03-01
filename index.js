@@ -384,4 +384,4 @@ function supportResistance(history, lookback = 30) {
   return { support, resistance, lookback };
 }
 
-asy
+async
