@@ -54,10 +54,13 @@ async function handleEvent(event) {
 async function askOpenAI(text) {
   try {
     const resp = await axios.post(
-      "https://api.openai.com/v1/responses",
+      "https://api.openai.com/v1/chat/completions",
       {
-        model: "gpt-4.1-mini",
-        input: `你是聊天助理。請用繁體中文回答，口吻自然。\n\n使用者：${text}`,
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "你是聊天助理，請用繁體中文自然回答" },
+          { role: "user", content: text }
+        ]
       },
       {
         headers: {
@@ -68,13 +71,8 @@ async function askOpenAI(text) {
       }
     );
 
-    // responses API 可能回 output_text 或 output[0].content...
-    const outputText =
-      resp.data.output_text ??
-      resp.data.output?.[0]?.content?.[0]?.text ??
-      "（我剛剛沒有拿到回覆內容）";
+    return resp.data.choices[0].message.content;
 
-    return String(outputText).trim() || "（空白回覆）";
   } catch (err) {
     const status = err.response?.status;
     const data = err.response?.data;
